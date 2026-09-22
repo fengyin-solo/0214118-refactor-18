@@ -4,7 +4,8 @@ import {
   WidgetType
 } from '@codemirror/view'
 import { RangeSetBuilder } from '@codemirror/state'
-import { parseMarkdownRegions } from './markdown-parser'
+import { parseMarkdownRegions, cursorOnRegion } from './markdown-parser'
+import { getBlockStructure } from './block-structures'
 
 /**
  * HR Widget — renders a horizontal rule
@@ -77,7 +78,7 @@ class ImageWidget extends WidgetType {
       wrapper.textContent = ''
       wrapper.className = ''
       wrapper.appendChild(img)
-    } 
+    }
     // 检查是否为本地文件系统路径
     else if (this.isLocalPath(this.url)) {
       wrapper.innerHTML = `
@@ -93,7 +94,7 @@ class ImageWidget extends WidgetType {
           <span style="font-size: 11px; opacity: 0.7;">提示：请使用 http:// 或 https:// 开头的网络图片地址</span>
         </div>
       `
-    } 
+    }
     // 其他情况（可能是相对路径或无效路径）
     else {
       wrapper.innerHTML = `
@@ -134,18 +135,30 @@ class CheckboxWidget extends WidgetType {
 }
 
 // Decoration marks
-const headingDeco = (level) => Decoration.mark({ class: `md-heading md-heading--${level}` })
 const boldDeco = Decoration.mark({ class: 'md-bold' })
 const italicDeco = Decoration.mark({ class: 'md-italic' })
 const strikeDeco = Decoration.mark({ class: 'md-strikethrough' })
 const inlineCodeDeco = Decoration.mark({ class: 'md-inline-code' })
 const linkDeco = Decoration.mark({ class: 'md-link' })
-const blockquoteDeco = Decoration.mark({ class: 'md-blockquote' })
 const syntaxHiddenDeco = Decoration.mark({ class: 'md-syntax-hidden' })
 const syntaxVisibleDeco = Decoration.mark({ class: 'md-syntax-visible' })
-const codeBlockDeco = Decoration.line({ class: 'md-code-block' })
 const listMarkerDeco = Decoration.mark({ class: 'md-list-marker' })
-const headingMarkDeco = Decoration.mark({ class: 'md-heading-mark' })
+
+// Shared class -> decoration cache so equivalent rules reuse instances.
+const markDecoCache = new Map()
+function markDecoFor(className) {
+  if (!markDecoCache.has(className)) {
+    markDecoCache.set(className, Decoration.mark({ class: className }))
+  }
+  return markDecoCache.get(className)
+}
+const lineDecoCache = new Map()
+function lineDecoFor(className) {
+  if (!lineDecoCache.has(className)) {
+    lineDecoCache.set(className, Decoration.line({ class: className }))
+  }
+  return lineDecoCache.get(className)
+}
 
 /**
  * Get the line range that the cursor is on.
@@ -162,10 +175,65 @@ function getCursorLineRanges(state) {
 }
 
 /**
- * Check if a region overlaps with any cursor line range.
+ * Shared cursor hit-test: does the region overlap any selection range?
  */
 function isCursorOnRegion(region, cursorRanges) {
-  return cursorRanges.some(cr => region.from <= cr.to && region.to >= cr.from)
+  return cursorRanges.some(cr => cursorOnRegion(region, cr.from, cr.to))
+}
+
+/**
+ * Resolve a rule range selector to document offsets.
+ * - [from, to] is returned as-is.
+ * - 'first' / 'last' resolve to the corresponding line of the region.
+ * - 'all' resolves to every line (used with line decorations).
+ * Returns [{ from, to, isLine }]; for line decorations from === to.
+ */
+function resolveRuleRanges(rule, region, state) {
+  if (Array.isArray(rule.range)) {
+    return [{ from: rule.range[0], to: rule.range[1], isLine: false }]
+  }
+
+  const startLine = state.doc.lineAt(region.from)
+  const endLine = state.doc.lineAt(region.to)
+
+  if (rule.line && rule.range === 'all') {
+    const out = []
+    for (let n = startLine.number; n <= endLine.number; n++) {
+      const line = state.doc.line(n)
+      out.push({ from: line.from, to: line.from, isLine: true })
+    }
+    return out
+  }
+
+  if (rule.line) {
+    const n = rule.range === 'first' ? startLine.number : endLine.number
+    const line = state.doc.line(n)
+    return [{ from: line.from, to: line.from, isLine: true }]
+  }
+
+  // Mark decorations spanning a selected fence line.
+  const line = rule.range === 'first' ? startLine : endLine
+  return [{ from: line.from, to: line.to, isLine: false }]
+}
+
+/**
+ * Apply one declarative block-structure rule to the decoration list.
+ * This is the single style path shared by heading, blockquote,
+ * code-block and any structure registered in block-structures.js.
+ */
+function applyBlockRule(rule, region, cursorOn, state, decos) {
+  let spec
+  if (rule.active || rule.inactive) {
+    spec = cursorOn ? rule.active : rule.inactive
+  } else {
+    spec = { className: rule.className }
+  }
+  if (!spec || !spec.className) return
+
+  for (const { from, to, isLine } of resolveRuleRanges(rule, region, state)) {
+    const deco = isLine ? lineDecoFor(spec.className) : markDecoFor(spec.className)
+    decos.push({ from, to, deco, isLine })
+  }
 }
 
 /**
@@ -177,29 +245,22 @@ function buildDecorations(view) {
   const doc = state.doc.toString()
   const regions = parseMarkdownRegions(doc)
   const cursorRanges = getCursorLineRanges(state)
-  const builder = new RangeSetBuilder()
-
-  // We need to collect all decorations and sort them by from position
   const decos = []
 
   for (const region of regions) {
     const cursorOn = isCursorOnRegion(region, cursorRanges)
 
-    switch (region.type) {
-      case 'heading': {
-        const { level, markFrom, markTo } = region.meta
-        // Always apply heading style to content
-        decos.push({ from: region.contentFrom, to: region.to, deco: headingDeco(level) })
-        if (cursorOn) {
-          // Show the hash marks with special styling
-          decos.push({ from: markFrom, to: markTo, deco: headingMarkDeco })
-        } else {
-          // Hide the hash marks
-          decos.push({ from: markFrom, to: markTo, deco: syntaxHiddenDeco })
-        }
-        break
+    // Unified path: registered block structures (heading, blockquote,
+    // code-block today) declare their boundaries and style rules once.
+    const blockDef = getBlockStructure(region.type)
+    if (blockDef) {
+      for (const rule of blockDef.decorate(region)) {
+        applyBlockRule(rule, region, cursorOn, state, decos)
       }
+      continue
+    }
 
+    switch (region.type) {
       case 'bold': {
         // Apply bold to content
         decos.push({ from: region.contentFrom, to: region.contentTo, deco: boldDeco })
@@ -296,17 +357,6 @@ function buildDecorations(view) {
         break
       }
 
-      case 'blockquote': {
-        const { markFrom, markTo } = region.meta
-        decos.push({ from: region.from, to: region.to, deco: blockquoteDeco })
-        if (!cursorOn) {
-          decos.push({ from: markFrom, to: markTo, deco: syntaxHiddenDeco })
-        } else {
-          decos.push({ from: markFrom, to: markTo, deco: syntaxVisibleDeco })
-        }
-        break
-      }
-
       case 'list-bullet': {
         const { markerFrom, markerTo } = region.meta
         decos.push({ from: markerFrom, to: markerTo, deco: listMarkerDeco })
@@ -332,26 +382,6 @@ function buildDecorations(view) {
         }
         break
       }
-
-      case 'code-block': {
-        // Apply line decoration to each line in the code block
-        const startLine = state.doc.lineAt(region.from)
-        const endLine = state.doc.lineAt(region.to)
-        for (let lineNum = startLine.number; lineNum <= endLine.number; lineNum++) {
-          const line = state.doc.line(lineNum)
-          decos.push({ from: line.from, to: line.from, deco: codeBlockDeco, isLine: true })
-        }
-        // Hide fence markers when cursor is not on the block
-        if (!cursorOn) {
-          const firstLine = state.doc.lineAt(region.from)
-          const lastLine = state.doc.lineAt(region.to)
-          // Hide opening fence
-          decos.push({ from: firstLine.from, to: firstLine.to, deco: syntaxHiddenDeco })
-          // Hide closing fence
-          decos.push({ from: lastLine.from, to: lastLine.to, deco: syntaxHiddenDeco })
-        }
-        break
-      }
     }
   }
 
@@ -364,7 +394,8 @@ function buildDecorations(view) {
     return 0
   })
 
-  // Filter out invalid ranges (from >= to for non-line decorations)
+  // Build the final RangeSet, filtering out invalid mark ranges.
+  const builder = new RangeSetBuilder()
   for (const d of decos) {
     if (d.isLine) {
       builder.add(d.from, d.from, d.deco)

@@ -6,7 +6,15 @@
  * - from/to: full range including syntax markers
  * - contentFrom/contentTo: range of the actual content (excluding markers)
  * - meta: additional info (heading level, language, url, etc.)
+ *
+ * Block-level boundary recognition (fenced code blocks, headings and
+ * blockquotes today; any new structure later) is driven by the single
+ * registry in ./block-structures. Inline passes (bold, links, ...) and
+ * the simple single-line block constructs (hr, lists, task lists) are
+ * handled locally below.
  */
+
+import { blockStructures } from './block-structures'
 
 /**
  * @typedef {Object} MarkdownRegion
@@ -27,61 +35,57 @@ export function parseMarkdownRegions(doc) {
   const regions = []
   const lines = doc.split('\n')
   let pos = 0
-  let inCodeBlock = false
-  let codeBlockStart = -1
-  let codeBlockLang = ''
-  let codeBlockMarkerLen = 0
+
+  // State of the single currently open block container (fence).
+  let open = null // { def, marker, region, startIndex }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const lineStart = pos
     const lineEnd = pos + line.length
+    const ctx = { line, lines, index: i, lineStart, lineEnd }
 
-    // Code block fences
-    const fenceMatch = line.match(/^(`{3,}|~{3,})(.*)$/)
-    if (fenceMatch) {
-      if (!inCodeBlock) {
-        inCodeBlock = true
-        codeBlockStart = lineStart
-        codeBlockLang = fenceMatch[2].trim()
-        codeBlockMarkerLen = fenceMatch[1].length
-        pos = lineEnd + 1
-        continue
-      } else if (fenceMatch[1].length >= codeBlockMarkerLen && fenceMatch[1][0] === (lines[findCodeBlockStartLine(lines, codeBlockStart, pos)]?.match(/^(`{3,}|~{3,})/)?.[1]?.[0] || '`')) {
-        regions.push({
-          type: 'code-block',
-          from: codeBlockStart,
-          to: lineEnd,
-          contentFrom: codeBlockStart,
-          contentTo: lineEnd,
-          meta: { language: codeBlockLang }
-        })
-        inCodeBlock = false
-        codeBlockStart = -1
-        codeBlockLang = ''
-        pos = lineEnd + 1
-        continue
+    // --- Container lifecycle: closing fence / swallowed body line ---
+    if (open) {
+      if (open.def.close(ctx, open.marker)) {
+        const finished = open.def.finish(ctx, open.marker, open.region)
+        if (finished) regions.push({ type: open.def.type, ...finished })
+        open = null
+      } else if (i === lines.length - 1) {
+        // Unclosed container at EOF: leaveOpen decides what is emitted;
+        // either way the trailing line is consumed as container body.
+        const leftover = open.def.leaveOpen(open.marker, open.region)
+        if (leftover) regions.push({ type: open.def.type, ...leftover })
+        open = null
       }
-    }
-
-    if (inCodeBlock) {
       pos = lineEnd + 1
       continue
     }
 
-    // Heading
-    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/)
-    if (headingMatch) {
-      const level = headingMatch[1].length
-      const markEnd = lineStart + level
-      regions.push({
-        type: 'heading',
-        from: lineStart,
-        to: lineEnd,
-        contentFrom: markEnd + 1,
-        contentTo: lineEnd,
-        meta: { level, markFrom: lineStart, markTo: markEnd + 1 }
-      })
+    let terminal = false
+
+    // --- Unified block boundary recognition ---
+    for (const def of blockStructures) {
+      const hit = def.match(ctx)
+      if (!hit) continue
+
+      if (hit.open) {
+        // Multi-line container starts here.
+        open = { def, marker: hit.marker, region: hit.region, startIndex: i }
+        terminal = true
+        break
+      }
+
+      regions.push({ type: def.type, ...hit })
+      if (def.terminal) {
+        terminal = true
+        break
+      }
+      // Annotating match (e.g. blockquote): keep running the remaining
+      // block passes and the inline pass on the same line.
+    }
+
+    if (terminal) {
       pos = lineEnd + 1
       continue
     }
@@ -98,19 +102,6 @@ export function parseMarkdownRegions(doc) {
       })
       pos = lineEnd + 1
       continue
-    }
-
-    // Blockquote
-    const bqMatch = line.match(/^(>\s?)(.*)$/)
-    if (bqMatch) {
-      regions.push({
-        type: 'blockquote',
-        from: lineStart,
-        to: lineEnd,
-        contentFrom: lineStart + bqMatch[1].length,
-        contentTo: lineEnd,
-        meta: { markFrom: lineStart, markTo: lineStart + bqMatch[1].length }
-      })
     }
 
     // Unordered list
@@ -169,15 +160,6 @@ export function parseMarkdownRegions(doc) {
   }
 
   return regions
-}
-
-function findCodeBlockStartLine(lines, codeBlockStart, currentPos) {
-  let p = 0
-  for (let i = 0; i < lines.length; i++) {
-    if (p === codeBlockStart) return i
-    p += lines[i].length + 1
-  }
-  return 0
 }
 
 /**
@@ -280,7 +262,8 @@ export function regionAtPos(regions, pos) {
 }
 
 /**
- * Check if a cursor line overlaps with a region.
+ * Shared boundary hit-test: does a region overlap the cursor line range?
+ * Used by the decoration plugin for every block/inline structure.
  * @param {MarkdownRegion} region
  * @param {number} lineFrom
  * @param {number} lineTo
