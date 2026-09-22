@@ -2,11 +2,19 @@
  * Markdown parser utilities.
  * Parses raw markdown text and identifies syntax regions for decoration.
  *
- * Each region has: { type, from, to, contentFrom, contentTo, meta }
+ * 块级结构（标题 / 引用 / 围栏 / 分割线 …）的边界识别统一由
+ * {@link BLOCK_STRUCTURES} 登记表驱动：扫描器只负责通用的
+ * 「逐行扫描 + 围栏开闭状态机」，各结构自身的规则只写在登记项里。
+ * 列表/任务列表与行内语法仍由本文件的专用规则处理。
+ *
+ * Each region has: { type, from, to, contentFrom, contentTo, meta, render? }
  * - from/to: full range including syntax markers
  * - contentFrom/contentTo: range of the actual content (excluding markers)
  * - meta: additional info (heading level, language, url, etc.)
+ * - render: 块级结构的统一样式指令（见 block-structures.js）
  */
+
+import { BLOCK_STRUCTURES } from './block-structures'
 
 /**
  * @typedef {Object} MarkdownRegion
@@ -16,7 +24,11 @@
  * @property {number} contentFrom
  * @property {number} contentTo
  * @property {Object} [meta]
+ * @property {Object} [render]
  */
+
+const FENCE_STRUCTURES = BLOCK_STRUCTURES.filter((s) => s.fence)
+const LINE_STRUCTURES = BLOCK_STRUCTURES.filter((s) => !s.fence)
 
 /**
  * Parse a document string and return all markdown regions.
@@ -27,90 +39,75 @@ export function parseMarkdownRegions(doc) {
   const regions = []
   const lines = doc.split('\n')
   let pos = 0
-  let inCodeBlock = false
-  let codeBlockStart = -1
-  let codeBlockLang = ''
-  let codeBlockMarkerLen = 0
+
+  // 通用围栏状态：{ structure, openStart, openLineEnd, markerChar, markerLen, meta }
+  // null 表示当前不在任何围栏结构内；EOF 时仍未闭合的围栏不产出区域（历史行为）。
+  let openFence = null
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const lineStart = pos
     const lineEnd = pos + line.length
 
-    // Code block fences
-    const fenceMatch = line.match(/^(`{3,}|~{3,})(.*)$/)
-    if (fenceMatch) {
-      if (!inCodeBlock) {
-        inCodeBlock = true
-        codeBlockStart = lineStart
-        codeBlockLang = fenceMatch[2].trim()
-        codeBlockMarkerLen = fenceMatch[1].length
-        pos = lineEnd + 1
-        continue
-      } else if (fenceMatch[1].length >= codeBlockMarkerLen && fenceMatch[1][0] === (lines[findCodeBlockStartLine(lines, codeBlockStart, pos)]?.match(/^(`{3,}|~{3,})/)?.[1]?.[0] || '`')) {
-        regions.push({
-          type: 'code-block',
-          from: codeBlockStart,
-          to: lineEnd,
-          contentFrom: codeBlockStart,
-          contentTo: lineEnd,
-          meta: { language: codeBlockLang }
-        })
-        inCodeBlock = false
-        codeBlockStart = -1
-        codeBlockLang = ''
+    // --- 围栏结构：统一的开闭边界识别 ---
+    if (openFence) {
+      const { structure } = openFence
+      const fenceMatch = line.match(structure.fence.openRe)
+      if (fenceMatch && structure.fence.closes(openFence, fenceMatch)) {
+        regions.push(
+          buildBlockRegion(structure, {
+            line,
+            lineStart,
+            lineEnd,
+            match: fenceMatch,
+            open: openFence
+          })
+        )
+        openFence = null
         pos = lineEnd + 1
         continue
       }
-    }
-
-    if (inCodeBlock) {
+      // 围栏内容行：跳过其他一切块/行内识别
       pos = lineEnd + 1
       continue
     }
 
-    // Heading
-    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/)
-    if (headingMatch) {
-      const level = headingMatch[1].length
-      const markEnd = lineStart + level
-      regions.push({
-        type: 'heading',
-        from: lineStart,
-        to: lineEnd,
-        contentFrom: markEnd + 1,
-        contentTo: lineEnd,
-        meta: { level, markFrom: lineStart, markTo: markEnd + 1 }
-      })
+    // 尚未进入围栏：检查任一登记的围栏结构是否在本行开启
+    let opened = false
+    for (const structure of FENCE_STRUCTURES) {
+      const fenceMatch = line.match(structure.fence.openRe)
+      if (fenceMatch) {
+        openFence = {
+          structure,
+          openStart: lineStart,
+          openLineEnd: lineEnd,
+          markerChar: fenceMatch[1][0],
+          markerLen: fenceMatch[1].length,
+          meta: { language: fenceMatch[2].trim() }
+        }
+        opened = true
+        break
+      }
+    }
+    if (opened) {
       pos = lineEnd + 1
       continue
     }
 
-    // Horizontal rule
-    if (/^(\*{3,}|-{3,}|_{3,})\s*$/.test(line)) {
-      regions.push({
-        type: 'hr',
-        from: lineStart,
-        to: lineEnd,
-        contentFrom: lineStart,
-        contentTo: lineEnd,
-        meta: {}
-      })
+    // --- 行内单发型块级结构：按登记表顺序尝试边界识别 ---
+    let blockSwallowsLine = false
+    for (const structure of LINE_STRUCTURES) {
+      const match = structure.match(line)
+      if (!match) continue
+      regions.push(buildBlockRegion(structure, { line, lineStart, lineEnd, match }))
+      // parseInline 的结构（如引用）命中后仍允许列表/行内规则继续处理本行；
+      // 其余结构（标题、分割线）整行消费，跳过后续识别。
+      blockSwallowsLine = !structure.parseInline
+      break
+    }
+    if (blockSwallowsLine) {
       pos = lineEnd + 1
       continue
-    }
-
-    // Blockquote
-    const bqMatch = line.match(/^(>\s?)(.*)$/)
-    if (bqMatch) {
-      regions.push({
-        type: 'blockquote',
-        from: lineStart,
-        to: lineEnd,
-        contentFrom: lineStart + bqMatch[1].length,
-        contentTo: lineEnd,
-        meta: { markFrom: lineStart, markTo: lineStart + bqMatch[1].length }
-      })
     }
 
     // Unordered list
@@ -171,13 +168,12 @@ export function parseMarkdownRegions(doc) {
   return regions
 }
 
-function findCodeBlockStartLine(lines, codeBlockStart, currentPos) {
-  let p = 0
-  for (let i = 0; i < lines.length; i++) {
-    if (p === codeBlockStart) return i
-    p += lines[i].length + 1
-  }
-  return 0
+/**
+ * Build a region from a block-structure registry entry and normalize it.
+ */
+function buildBlockRegion(structure, ctx) {
+  const region = structure.buildRegion(ctx)
+  return { type: structure.type, ...region }
 }
 
 /**
@@ -280,7 +276,9 @@ export function regionAtPos(regions, pos) {
 }
 
 /**
- * Check if a cursor line overlaps with a region.
+ * Check if a region overlaps a single cursor line range.
+ *
+ * 所有块级 / 行内结构共用这一套光标命中判定：区域与行区间相交即命中。
  * @param {MarkdownRegion} region
  * @param {number} lineFrom
  * @param {number} lineTo
@@ -288,4 +286,14 @@ export function regionAtPos(regions, pos) {
  */
 export function cursorOnRegion(region, lineFrom, lineTo) {
   return region.from <= lineTo && region.to >= lineFrom
+}
+
+/**
+ * Check if a region overlaps with any of the cursor line ranges.
+ * @param {MarkdownRegion} region
+ * @param {{from: number, to: number}[]} lineRanges
+ * @returns {boolean}
+ */
+export function regionHitsLineRanges(region, lineRanges) {
+  return lineRanges.some((r) => cursorOnRegion(region, r.from, r.to))
 }

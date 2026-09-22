@@ -4,7 +4,15 @@ import {
   WidgetType
 } from '@codemirror/view'
 import { RangeSetBuilder } from '@codemirror/state'
-import { parseMarkdownRegions } from './markdown-parser'
+import { parseMarkdownRegions, regionHitsLineRanges } from './markdown-parser'
+
+/**
+ * 块级结构的渲染模型（标题/引用/围栏/分割线…）统一为两种东西：
+ * 1. Widget：未命中光标时整体替换区域（见 WIDGETS）
+ * 2. 样式指令 render（contentClass / lineClass / markers / hideLines…）：
+ *    由 {@link applyBlockRender} 统一映射为 CodeMirror decorations。
+ * 行内结构（粗体/斜体/链接等）与列表仍在本文件按各自规则处理。
+ */
 
 /**
  * HR Widget — renders a horizontal rule
@@ -77,7 +85,7 @@ class ImageWidget extends WidgetType {
       wrapper.textContent = ''
       wrapper.className = ''
       wrapper.appendChild(img)
-    } 
+    }
     // 检查是否为本地文件系统路径
     else if (this.isLocalPath(this.url)) {
       wrapper.innerHTML = `
@@ -93,7 +101,7 @@ class ImageWidget extends WidgetType {
           <span style="font-size: 11px; opacity: 0.7;">提示：请使用 http:// 或 https:// 开头的网络图片地址</span>
         </div>
       `
-    } 
+    }
     // 其他情况（可能是相对路径或无效路径）
     else {
       wrapper.innerHTML = `
@@ -133,19 +141,23 @@ class CheckboxWidget extends WidgetType {
   eq(other) { return other.checked === this.checked }
 }
 
+/**
+ * 块级 widget 登记表：与 block-structures.js 中 render.widget 标识一一对应。
+ * 新增需要整体替换为 widget 的块级结构时，在此处追加一个工厂即可。
+ */
+const WIDGETS = {
+  hr: () => new HrWidget()
+}
+
 // Decoration marks
-const headingDeco = (level) => Decoration.mark({ class: `md-heading md-heading--${level}` })
 const boldDeco = Decoration.mark({ class: 'md-bold' })
 const italicDeco = Decoration.mark({ class: 'md-italic' })
 const strikeDeco = Decoration.mark({ class: 'md-strikethrough' })
 const inlineCodeDeco = Decoration.mark({ class: 'md-inline-code' })
 const linkDeco = Decoration.mark({ class: 'md-link' })
-const blockquoteDeco = Decoration.mark({ class: 'md-blockquote' })
+const listMarkerDeco = Decoration.mark({ class: 'md-list-marker' })
 const syntaxHiddenDeco = Decoration.mark({ class: 'md-syntax-hidden' })
 const syntaxVisibleDeco = Decoration.mark({ class: 'md-syntax-visible' })
-const codeBlockDeco = Decoration.line({ class: 'md-code-block' })
-const listMarkerDeco = Decoration.mark({ class: 'md-list-marker' })
-const headingMarkDeco = Decoration.mark({ class: 'md-heading-mark' })
 
 /**
  * Get the line range that the cursor is on.
@@ -162,18 +174,73 @@ function getCursorLineRanges(state) {
 }
 
 /**
- * Check if a region overlaps with any cursor line range.
+ * Apply one block region's unified render directive.
+ *
+ * 所有块级结构共用这一套边界 → decoration 的映射，命中判定也共用
+ * regionHitsLineRanges；本函数不关心 region.type，只消费 render 指令。
+ *
+ * @param {MarkdownRegion} region
+ * @param {boolean} cursorOn - 光标所在行是否与区域相交
+ * @param {EditorState} state
+ * @param {Array} decos - 收集 { from, to, deco, isLine }
  */
-function isCursorOnRegion(region, cursorRanges) {
-  return cursorRanges.some(cr => region.from <= cr.to && region.to >= cr.from)
+function applyBlockRender(region, cursorOn, state, decos) {
+  const render = region.render
+  if (!render) return
+
+  // 未命中且声明了整体 widget：整块替换，其余指令不再生效
+  if (render.widget && !cursorOn) {
+    decos.push({
+      from: region.from,
+      to: region.to,
+      deco: Decoration.replace({ widget: WIDGETS[render.widget]() })
+    })
+    return
+  }
+
+  // 常驻内容样式（范围默认 contentFrom..contentTo，可用 contentRange 覆盖）
+  if (render.contentClass) {
+    const range = render.contentRange || { from: region.contentFrom, to: region.contentTo }
+    decos.push({ from: range.from, to: range.to, deco: Decoration.mark({ class: render.contentClass }) })
+  }
+
+  // 行样式：区域覆盖的每一行各生成一个 line decoration
+  if (render.lineClass) {
+    const lineDeco = Decoration.line({ class: render.lineClass })
+    const startLine = state.doc.lineAt(region.from)
+    const endLine = state.doc.lineAt(region.to)
+    for (let lineNum = startLine.number; lineNum <= endLine.number; lineNum++) {
+      const lineFrom = state.doc.line(lineNum).from
+      decos.push({ from: lineFrom, to: lineFrom, deco: lineDeco, isLine: true })
+    }
+  }
+
+  if (render.hideLines && Array.isArray(render.markerLines)) {
+    // 围栏型：未命中时整体隐藏开/闭标记行；命中时恢复原始语法（不装饰）
+    if (!cursorOn) {
+      for (const markerLine of render.markerLines) {
+        decos.push({ from: markerLine.from, to: markerLine.to, deco: syntaxHiddenDeco })
+      }
+    }
+    return
+  }
+
+  // 语法标记：未命中隐藏；命中使用结构声明的弱化样式（缺省 md-syntax-visible）
+  if (Array.isArray(render.markers)) {
+    const activeDeco = render.markerActiveClass
+      ? Decoration.mark({ class: render.markerActiveClass })
+      : syntaxVisibleDeco
+    for (const marker of render.markers) {
+      decos.push({ from: marker.from, to: marker.to, deco: cursorOn ? activeDeco : syntaxHiddenDeco })
+    }
+  }
 }
 
 /**
  * Build decorations for the entire document.
  * Core logic: if cursor is on a region, show syntax marks; otherwise, hide them and show rendered result.
  */
-function buildDecorations(view) {
-  const { state } = view
+function buildDecorations(state) {
   const doc = state.doc.toString()
   const regions = parseMarkdownRegions(doc)
   const cursorRanges = getCursorLineRanges(state)
@@ -183,23 +250,15 @@ function buildDecorations(view) {
   const decos = []
 
   for (const region of regions) {
-    const cursorOn = isCursorOnRegion(region, cursorRanges)
+    const cursorOn = regionHitsLineRanges(region, cursorRanges)
+
+    // 带统一 render 指令的块级结构（heading / hr / blockquote / code-block）
+    if (region.render) {
+      applyBlockRender(region, cursorOn, state, decos)
+      continue
+    }
 
     switch (region.type) {
-      case 'heading': {
-        const { level, markFrom, markTo } = region.meta
-        // Always apply heading style to content
-        decos.push({ from: region.contentFrom, to: region.to, deco: headingDeco(level) })
-        if (cursorOn) {
-          // Show the hash marks with special styling
-          decos.push({ from: markFrom, to: markTo, deco: headingMarkDeco })
-        } else {
-          // Hide the hash marks
-          decos.push({ from: markFrom, to: markTo, deco: syntaxHiddenDeco })
-        }
-        break
-      }
-
       case 'bold': {
         // Apply bold to content
         decos.push({ from: region.contentFrom, to: region.contentTo, deco: boldDeco })
@@ -283,30 +342,6 @@ function buildDecorations(view) {
         break
       }
 
-      case 'hr': {
-        if (!cursorOn) {
-          decos.push({
-            from: region.from,
-            to: region.to,
-            deco: Decoration.replace({
-              widget: new HrWidget()
-            })
-          })
-        }
-        break
-      }
-
-      case 'blockquote': {
-        const { markFrom, markTo } = region.meta
-        decos.push({ from: region.from, to: region.to, deco: blockquoteDeco })
-        if (!cursorOn) {
-          decos.push({ from: markFrom, to: markTo, deco: syntaxHiddenDeco })
-        } else {
-          decos.push({ from: markFrom, to: markTo, deco: syntaxVisibleDeco })
-        }
-        break
-      }
-
       case 'list-bullet': {
         const { markerFrom, markerTo } = region.meta
         decos.push({ from: markerFrom, to: markerTo, deco: listMarkerDeco })
@@ -329,26 +364,6 @@ function buildDecorations(view) {
               widget: new CheckboxWidget(checked)
             })
           })
-        }
-        break
-      }
-
-      case 'code-block': {
-        // Apply line decoration to each line in the code block
-        const startLine = state.doc.lineAt(region.from)
-        const endLine = state.doc.lineAt(region.to)
-        for (let lineNum = startLine.number; lineNum <= endLine.number; lineNum++) {
-          const line = state.doc.line(lineNum)
-          decos.push({ from: line.from, to: line.from, deco: codeBlockDeco, isLine: true })
-        }
-        // Hide fence markers when cursor is not on the block
-        if (!cursorOn) {
-          const firstLine = state.doc.lineAt(region.from)
-          const lastLine = state.doc.lineAt(region.to)
-          // Hide opening fence
-          decos.push({ from: firstLine.from, to: firstLine.to, deco: syntaxHiddenDeco })
-          // Hide closing fence
-          decos.push({ from: lastLine.from, to: lastLine.to, deco: syntaxHiddenDeco })
         }
         break
       }
@@ -382,12 +397,12 @@ function buildDecorations(view) {
 export const markdownDecorationPlugin = ViewPlugin.fromClass(
   class {
     constructor(view) {
-      this.decorations = buildDecorations(view)
+      this.decorations = buildDecorations(view.state)
     }
 
     update(update) {
       if (update.docChanged || update.selectionSet || update.viewportChanged) {
-        this.decorations = buildDecorations(update.view)
+        this.decorations = buildDecorations(update.state)
       }
     }
   },
@@ -395,3 +410,6 @@ export const markdownDecorationPlugin = ViewPlugin.fromClass(
     decorations: (v) => v.decorations
   }
 )
+
+// Exposed for tooling/tests: pure decoration builder driven by editor state.
+export { buildDecorations }
